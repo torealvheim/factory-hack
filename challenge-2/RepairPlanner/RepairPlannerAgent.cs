@@ -4,6 +4,7 @@ using System.Text.Json.Serialization;
 using Azure.AI.Projects;
 using Azure.AI.Projects.OpenAI;
 using Microsoft.Agents.AI;
+using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;
 using RepairPlanner.Models;
 using RepairPlanner.Services;
@@ -154,8 +155,22 @@ public sealed class RepairPlannerAgent(
         // -- Step 4: Invoke the Foundry agent ----------------------------------
         logger.LogInformation("Invoking Foundry agent '{Name}'...", AgentName);
 
+        // ChatClientAgentRunOptions lets us pass ChatOptions (like Python's
+        // extra_body={"response_format": ...}) down to the underlying chat client.
+        // ForJsonSchema<WorkOrder>() generates a JSON Schema from the WorkOrder
+        // type and instructs the model to output ONLY valid WorkOrder JSON —
+        // eliminating Markdown wrapping and field type mismatches.
+        var runOptions = new ChatClientAgentRunOptions
+        {
+            ChatOptions = new ChatOptions
+            {
+                ResponseFormat = ChatResponseFormat.ForJsonSchema<WorkOrder>(
+                    JsonOptions, "WorkOrder", "A repair work order for a manufacturing machine")
+            }
+        };
+
         var agent = projectClient.GetAIAgent(name: AgentName);
-        var agentResponse = await agent.RunAsync(prompt, thread: null, options: null);
+        var agentResponse = await agent.RunAsync(prompt, thread: null, options: runOptions);
 
         // ?? means "if null, use empty string" (like Python: text or "")
         var rawJson = agentResponse.Text ?? string.Empty;
