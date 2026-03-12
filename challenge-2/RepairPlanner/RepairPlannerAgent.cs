@@ -137,6 +137,17 @@ public sealed class RepairPlannerAgent(
         logger.LogInformation("Found {Tech} technician(s) and {Parts} part(s) in stock.",
             technicians.Count, parts.Count);
 
+        // Warn early when no technicians match — the agent will still produce a
+        // repair plan, but the work order will be held as "pending_assignment"
+        // until a qualified technician becomes available.
+        if (technicians.Count == 0)
+        {
+            logger.LogWarning(
+                "No available technicians found for skills [{Skills}] on fault '{FaultType}'. " +
+                "Work order will be created with status 'pending_assignment'.",
+                string.Join(", ", requiredSkills), fault.FaultType);
+        }
+
         // -- Step 3: Build the context prompt ----------------------------------
         var prompt = BuildPrompt(fault, technicians, parts, requiredSkills, requiredPartNumbers);
 
@@ -156,6 +167,19 @@ public sealed class RepairPlannerAgent(
         // Apply sensible defaults for any fields the LLM may have omitted.
         // ??= means "assign only if the current value is null"
         workOrder.Priority ??= MapSeverityToPriority(fault.Severity);
+
+        // Enforce a priority floor: the fault severity is the authoritative minimum.
+        // If the LLM set a lower priority than the severity warrants, override it.
+        // Example: severity=Critical but LLM returned priority=medium → force "critical".
+        var severityFloor = MapSeverityToPriority(fault.Severity);
+        if (PriorityRank(workOrder.Priority) < PriorityRank(severityFloor))
+        {
+            logger.LogWarning(
+                "LLM returned priority '{LLMPriority}' which is lower than severity floor '{Floor}'. Overriding.",
+                workOrder.Priority, severityFloor);
+            workOrder.Priority = severityFloor;
+        }
+
         workOrder.WorkOrderNumber = workOrder.WorkOrderNumber is { Length: > 0 }
             ? workOrder.WorkOrderNumber
             : $"WO-{fault.MachineId}-{DateTime.UtcNow:yyyyMMdd-HHmmss}";
@@ -163,6 +187,18 @@ public sealed class RepairPlannerAgent(
         workOrder.MachineId = fault.MachineId;
         workOrder.DiagnosedFault = fault;
         workOrder.CreatedAt = DateTime.UtcNow.ToString("o");
+
+        // Override status and assignment when no technicians were available,
+        // regardless of what the LLM returned. The work order is still saved
+        // so it can be picked up once a technician becomes free.
+        if (technicians.Count == 0)
+        {
+            workOrder.Status = "pending_assignment";
+            workOrder.AssignedTo = null;
+            workOrder.Notes = string.IsNullOrWhiteSpace(workOrder.Notes)
+                ? $"No technician with skills [{string.Join(", ", requiredSkills)}] was available at creation time. Awaiting assignment."
+                : workOrder.Notes + $" | No technician available for skills: [{string.Join(", ", requiredSkills)}].";
+        }
 
         // -- Step 6: Persist to Cosmos DB -------------------------------------
         var saved = await cosmosDb.SaveWorkOrderAsync(workOrder, ct);
@@ -310,6 +346,18 @@ public sealed class RepairPlannerAgent(
         "critical" => "critical",
         "high"     => "high",
         "medium"   => "medium",
-        _          => "low",
+        "low"      => "low",
+        _          => "low",   // unknown severity → safest default
+    };
+
+    // Returns a numeric rank so priorities can be compared.
+    // Higher rank = higher urgency (critical=4, high=3, medium=2, low=1).
+    private static int PriorityRank(string? priority) => priority?.ToLowerInvariant() switch
+    {
+        "critical" => 4,
+        "high"     => 3,
+        "medium"   => 2,
+        "low"      => 1,
+        _          => 0,
     };
 }
